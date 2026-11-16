@@ -1,4 +1,4 @@
-// Driver for the fast-marked entry.
+// Driver for the marked-faster entry.
 //
 // The harness runs this file as `node /bot/main.ts`. It reads the case set
 // (a JSON array of { id, markdown }) from the input directory, renders each
@@ -12,16 +12,13 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const inDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const cases: { id: string; markdown: string }[] = JSON.parse(
-  readFileSync(join(inputDir, 'cases.json'), 'utf8')
-);
+const raw = readFileSync(join(inDir, 'cases.json'), 'utf8');
+const items = JSON.parse(raw) as { id: string; markdown: string }[];
 
-const rendered: string[] = new Array(cases.length);
-for (let i = 0; i < cases.length; i++) {
-  rendered[i] = parse(cases[i].markdown);
-}
+const html: string[] = new Array(items.length);
+for (let i = 0; i < items.length; i++) html[i] = parse(items[i].markdown);
 
-writeFileSync(join(outputDir, 'html.json'), JSON.stringify(rendered));
+writeFileSync(join(outDir, 'html.json'), JSON.stringify(html));

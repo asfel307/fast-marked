@@ -1,77 +1,60 @@
-// fast-marked — a faster drop-in for marked 18.1.3.
+// marked-faster — a quicker drop-in for marked 18.1.3.
 //
-// The entry is a fork of marked (MIT, see vendor/marked/). marked's own
-// tokenizer methods still build every token, which is what keeps the HTML
-// byte-identical, but the two dispatch loops that drive them are rewritten:
+// marked's own Tokenizer still does the real work: it builds every token,
+// which is why the HTML comes out byte for byte the same. What this file
+// changes is only how the tokenizer methods get called. marked tries its
+// block rules one after another on every line and its inline rules one
+// after another on every character, running a pile of regular expressions
+// that cannot possibly match. Here the first character decides which rules
+// are even attempted:
 //
-//   * The block loop looks at the first character of the remaining text and
-//     only tries the block rules that can start with it (a `#` line can only
-//     be a heading, a table, a setext heading or a paragraph, never a list
-//     or a blockquote, so those regexes are never run). A table, a setext
-//     heading, a paragraph and plain text stay on the candidate list for
-//     every line, because their first line can start with anything.
-//   * The inline loop does the same per character: a backslash can only be
-//     an escape, a backtick can only open a code span, `[` can only start
-//     a link, and so on. Plain text is still consumed by marked's own
-//     inlineText, so a run of ordinary words costs one match.
+//   * At block level a line that opens with `#` is tried as a heading, a
+//     table, a setext heading or a paragraph, and never as a list, a
+//     blockquote or an HTML block. Table, setext heading, paragraph and
+//     plain text are tried for every line, because any of them can start
+//     with any character at all.
+//   * At inline level a backslash is only ever an escape or a hard break,
+//     a backtick only ever opens a code span, `[` only ever starts a link,
+//     and so on. Runs of ordinary words go straight to marked's own text
+//     rule, so a paragraph of prose costs one match per run.
 //
-// The emphasis masking marked performs before its inline loop is reproduced
-// here (same regexes, same replacements), because emStrong and del scan the
-// masked copy for their closers. The only thing this file cannot reuse is
-// marked's internal closer cache, so an emphasis run re-scans the masked
-// text once per delimiter; paragraphs are short, so that stays cheap.
+// The emphasis pass needs a masked copy of the inline source, the way
+// marked makes one, so that a `*` sitting inside a link destination, a
+// code span or inline HTML is never treated as a delimiter. That masking
+// is reproduced below with the same patterns marked uses. marked's own
+// closer cache is internal and cannot be reused, so an emphasis run
+// re-scans the masked text once per delimiter run; inline runs are short,
+// so that stays cheap.
 
 import { Lexer, Parser, Tokenizer, getDefaults } from './vendor/marked/marked.esm.js';
 
-// How marked normalises a link-reference label: trim it, collapse each run
-// of whitespace to a single space, then fold the case in a Unicode-aware way.
-function normalizeLabel(label) {
-  return label.trim().replace(/\s+/g, ' ').toLowerCase().toUpperCase().toLowerCase();
+// Fold a link-reference label the way marked does: trim the ends, squash
+// every run of whitespace down to one space, then fold the case through
+// lower, upper and lower again so the fold is Unicode-aware.
+function foldLabel(text) {
+  const squashed = text.trim().replace(/\s+/g, ' ');
+  return squashed.toLowerCase().toUpperCase().toLowerCase();
 }
 
-// True when a URL or e-mail address could start with this character code.
-// The URL rule matches a scheme (http, https, ftp, www, mailto) or an
-// address whose local part uses these characters, so anything outside this
-// set can skip the URL attempt entirely.
-function canStartUrl(code) {
-  if (code >= 48 && code <= 57) return true; // 0-9
-  if (code >= 65 && code <= 90) return true; // A-Z
-  if (code >= 97 && code <= 122) return true; // a-z
-  switch (code) {
-    case 33: // !
-    case 35: // #
-    case 36: // $
-    case 37: // %
-    case 38: // &
-    case 39: // '
-    case 42: // *
-    case 43: // +
-    case 45: // -
-    case 46: // .
-    case 47: // /
-    case 61: // =
-    case 63: // ?
-    case 94: // ^
-    case 95: // _
-    case 96: // `
-    case 123: // {
-    case 124: // |
-    case 125: // }
-    case 126: // ~
-      return true;
-    default:
-      return false;
-  }
+// The characters that may open a URL or an e-mail address, as a table over
+// the ASCII range. A URL rule matches a scheme (http, https, ftp, www,
+// mailto) or an address whose local part is built from these characters,
+// so any other character can skip the URL attempt outright.
+const urlOk = new Uint8Array(128);
+for (const ch of '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&\'*+-./=?^_`{|}~') {
+  urlOk[ch.charCodeAt(0)] = 1;
+}
+function urlStarter(code) {
+  return code < 128 && urlOk[code] === 1;
 }
 
-class FastLexer extends Lexer {
+class DispatchLexer extends Lexer {
   // Same entry point as marked's lexer, except the carriage-return pass is
-  // skipped when the input holds no carriage return at all (the replace
-  // would be a no-op there, but the regex would still scan the whole text).
+  // skipped outright when the input has no carriage return in it: the
+  // replacement would change nothing there, but the pattern would still
+  // walk the whole text to find out.
   lex(src) {
-    if (src.includes('\r')) {
-      src = src.replace(this.tokenizer.rules.other.carriageReturn, '\n');
-    }
+    if (src.includes('\r')) src = src.replace(this.tokenizer.rules.other.carriageReturn, '\n');
     this.blockTokens(src, this.tokens);
     for (let i = 0; i < this.inlineQueue.length; i++) {
       const item = this.inlineQueue[i];
@@ -82,17 +65,23 @@ class FastLexer extends Lexer {
     return this.tokens;
   }
 
-  // Block tokenisation with a first-character dispatch. The candidate rules
-  // are always tried in marked's own order; the dispatch only drops the
-  // ones whose pattern cannot start with the character at hand. Paragraph
-  // and plain text are always candidates, and a table and a setext heading
-  // are too, because either can begin with any character.
-  blockTokens(src, tokens = [], cont = false) {
+  // Block tokenisation driven by the first character. Rules are still
+  // attempted in marked's own order; the dispatch only leaves out the
+  // ones whose pattern cannot open with the character at hand. Paragraph
+  // and plain text are candidates on every line, and so are table and
+  // setext heading, because either of them can begin with anything.
+  blockTokens(src, tokens = [], continued = false) {
     this.tokenizer.lexer = this;
     const other = this.tokenizer.rules.other;
     if (this.options.pedantic) {
       src = src.replace(other.tabCharGlobal, '    ').replace(other.spaceLine, '');
     }
+    // Consume a matched token: drop its raw text from the front of the
+    // source and record the token.
+    const take = (tok) => {
+      src = src.slice(tok.raw.length);
+      tokens.push(tok);
+    };
     let shortest = Infinity;
     while (src) {
       if (src.length < shortest) {
@@ -105,8 +94,7 @@ class FastLexer extends Lexer {
       if (this.options.extensions?.block?.some((ext) => {
         token = ext.call({ lexer: this }, src, tokens);
         if (token) {
-          src = src.substring(token.raw.length);
-          tokens.push(token);
+          take(token);
           return true;
         }
         return false;
@@ -114,9 +102,9 @@ class FastLexer extends Lexer {
         continue;
       }
       const first = src.charCodeAt(0);
-      const blank = first === 32 || first === 9; // space or tab
-      if ((first === 10 || blank) && (token = this.tokenizer.space(src))) {
-        src = src.substring(token.raw.length);
+      const ws = first === 32 || first === 9;
+      if ((first === 10 || ws) && (token = this.tokenizer.space(src))) {
+        src = src.slice(token.raw.length);
         const prev = tokens.at(-1);
         if (token.raw.length === 1 && prev !== undefined) {
           prev.raw += '\n';
@@ -125,8 +113,8 @@ class FastLexer extends Lexer {
         }
         continue;
       }
-      if (blank && (token = this.tokenizer.code(src))) {
-        src = src.substring(token.raw.length);
+      if (ws && (token = this.tokenizer.code(src))) {
+        src = src.slice(token.raw.length);
         const prev = tokens.at(-1);
         if (prev?.type === 'paragraph' || prev?.type === 'text') {
           prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + token.raw;
@@ -137,38 +125,32 @@ class FastLexer extends Lexer {
         }
         continue;
       }
-      if ((blank || first === 96 || first === 126) && (token = this.tokenizer.fences(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if ((ws || first === 96 || first === 126) && (token = this.tokenizer.fences(src))) {
+        take(token);
         continue;
       }
-      if ((blank || first === 35) && (token = this.tokenizer.heading(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if ((ws || first === 35) && (token = this.tokenizer.heading(src))) {
+        take(token);
         continue;
       }
-      if ((blank || first === 45 || first === 95 || first === 42) && (token = this.tokenizer.hr(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if ((ws || first === 45 || first === 95 || first === 42) && (token = this.tokenizer.hr(src))) {
+        take(token);
         continue;
       }
-      if ((blank || first === 62) && (token = this.tokenizer.blockquote(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if ((ws || first === 62) && (token = this.tokenizer.blockquote(src))) {
+        take(token);
         continue;
       }
-      if ((blank || first === 42 || first === 43 || first === 45 || (first >= 48 && first <= 57)) && (token = this.tokenizer.list(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if ((ws || first === 42 || first === 43 || first === 45 || (first >= 48 && first <= 57)) && (token = this.tokenizer.list(src))) {
+        take(token);
         continue;
       }
-      if ((blank || first === 60) && (token = this.tokenizer.html(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+      if ((ws || first === 60) && (token = this.tokenizer.html(src))) {
+        take(token);
         continue;
       }
-      if ((blank || first === 91) && (token = this.tokenizer.def(src))) {
-        src = src.substring(token.raw.length);
+      if ((ws || first === 91) && (token = this.tokenizer.def(src))) {
+        src = src.slice(token.raw.length);
         const prev = tokens.at(-1);
         if (prev?.type === 'paragraph' || prev?.type === 'text') {
           prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + token.raw;
@@ -183,13 +165,11 @@ class FastLexer extends Lexer {
         continue;
       }
       if ((token = this.tokenizer.table(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+        take(token);
         continue;
       }
       if ((token = this.tokenizer.lheading(src))) {
-        src = src.substring(token.raw.length);
-        tokens.push(token);
+        take(token);
         continue;
       }
       let cut = src;
@@ -204,7 +184,7 @@ class FastLexer extends Lexer {
       }
       if (this.state.top && (token = this.tokenizer.paragraph(cut))) {
         const prev = tokens.at(-1);
-        if (cont && prev?.type === 'paragraph') {
+        if (continued && prev?.type === 'paragraph') {
           prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + token.raw;
           prev.text += '\n' + token.text;
           this.inlineQueue.pop();
@@ -212,12 +192,12 @@ class FastLexer extends Lexer {
         } else {
           tokens.push(token);
         }
-        cont = cut.length !== src.length;
-        src = src.substring(token.raw.length);
+        continued = cut.length !== src.length;
+        src = src.slice(token.raw.length);
         continue;
       }
       if ((token = this.tokenizer.text(src))) {
-        src = src.substring(token.raw.length);
+        src = src.slice(token.raw.length);
         const prev = tokens.at(-1);
         if (prev?.type === 'text') {
           prev.raw += (prev.raw.endsWith('\n') ? '' : '\n') + token.raw;
@@ -238,79 +218,91 @@ class FastLexer extends Lexer {
     return tokens;
   }
 
-  // Inline tokenisation entry point: same link-paren bookkeeping as marked,
-  // then the dispatched loop below.
+  // Inline tokenisation entry point: the same link-paren bookkeeping as
+  // marked, then the dispatched scan below.
   inlineTokens(src, tokens = []) {
     this.tokenizer.lexer = this;
     const saved = this.state.linkParenPossible;
     this.state.linkParenPossible = saved && src.includes(')');
     try {
-      return this.inlineLoop(src, tokens);
+      return this.scanInline(src, tokens);
     } finally {
       this.state.linkParenPossible = saved;
     }
   }
 
-  // The masked copy emStrong and del scan for their closers. Link and image
-  // destinations, code spans and inline HTML are blanked out to same-length
-  // placeholders so a `*` inside them never counts as a delimiter, and
-  // reference links that resolve are blanked the same way.
-  maskInline(src) {
+  // Try to read a URL or e-mail token at the front of `rest`. Returns the
+  // remaining text after the token, or null when no URL matched or when
+  // the lexer is already inside a link.
+  attemptUrl(rest, tokens) {
+    if (this.state.inLink) return null;
+    const hit = this.tokenizer.url(rest);
+    if (!hit) return null;
+    tokens.push(hit);
+    return rest.slice(hit.raw.length);
+  }
+
+  // The masked copy that emStrong and del scan for their closers. Link
+  // and image destinations, code spans and inline HTML are blanked out
+  // to placeholders of the same length, so a `*` inside any of them never
+  // counts as a delimiter, and reference links that resolve are blanked
+  // the same way.
+  blankInline(src) {
     const rules = this.tokenizer.rules.inline;
-    let masked = src;
+    let out = src;
     if (this.tokens.links && src.includes('[')) {
-      const search = rules.reflinkSearch;
-      const maskRef = (match) => {
-        const open = match.lastIndexOf('[');
-        if (!Object.hasOwn(this.tokens.links, normalizeLabel(match.slice(open + 1, -1)))) {
-          return match;
+      const find = rules.reflinkSearch;
+      const blankRef = (hit) => {
+        const open = hit.lastIndexOf('[');
+        if (!Object.hasOwn(this.tokens.links, foldLabel(hit.slice(open + 1, -1)))) {
+          return hit;
         }
-        if (open > 1 && match.charAt(0) !== '!') {
-          const inner = match.slice(1, open - 1);
+        if (open > 1 && hit.charAt(0) !== '!') {
+          const inner = hit.slice(1, open - 1);
           if (this.linkInText(inner)) {
-            return '[' + inner.replace(search, maskRef) + '][' + 'a'.repeat(match.length - open - 2) + ']';
+            return '[' + inner.replace(find, blankRef) + '][' + 'a'.repeat(hit.length - open - 2) + ']';
           }
         }
-        return '[' + 'a'.repeat(match.length - 2) + ']';
+        return '[' + 'a'.repeat(hit.length - 2) + ']';
       };
-      masked = masked.replace(search, maskRef);
+      out = out.replace(find, blankRef);
     }
-    masked = masked.replace(
+    out = out.replace(
       rules.anyPunctuationOutsideCode,
-      (match, ticks, escaped) => escaped
-        ? '+'.repeat(match.length)
+      (hit, ticks, escaped) => escaped
+        ? '+'.repeat(hit.length)
         : ticks
-          ? ticks + match.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks
-          : match
+          ? ticks + hit.slice(ticks.length, -ticks.length).replace(/`/g, '+') + ticks
+          : hit
     );
-    masked = masked.replace(
+    out = out.replace(
       rules.blockSkip,
-      (match, _ticks, empty) => {
+      (hit, _ticks, empty) => {
         const lead = empty ? empty.length : 0;
-        return match.slice(0, lead) + '[' + 'a'.repeat(match.length - lead - 2) + ']';
+        return hit.slice(0, lead) + '[' + 'a'.repeat(hit.length - lead - 2) + ']';
       }
     );
     const hook = this.options.hooks?.emStrongMask;
-    if (hook) masked = hook.call({ lexer: this }, masked) ?? masked;
-    return masked;
+    if (hook) out = hook.call({ lexer: this }, out) ?? out;
+    return out;
   }
 
-  // Inline tokenisation with a first-character dispatch. At each position
-  // only the inline rules that can start with that character are tried, in
-  // marked's own order; a URL or e-mail is tried whenever the character
-  // could start one, and plain text falls through to marked's inlineText.
-  // `prevChar` is the last character of the preceding text token (or the
+  // Inline tokenisation driven by the first character. At each position
+  // only the inline rules that can open with that character are tried,
+  // in marked's own order; a URL or e-mail is tried whenever the character
+  // could open one, and plain text falls through to marked's inlineText.
+  // `lastChar` is the last character of the preceding text token (or the
   // empty string when the preceding token was not text), exactly as marked
   // tracks it for its emphasis and strikethrough closers.
-  inlineLoop(src, tokens) {
+  scanInline(src, tokens) {
     const tok = this.tokenizer;
-    const hasEmphasis = src.includes('*') || src.includes('_') || src.includes('~');
-    const customEmphasis = this.options.hooks?.emStrongMask
+    const needMask = src.includes('*') || src.includes('_') || src.includes('~');
+    const custom = this.options.hooks?.emStrongMask
       || tok.emStrong !== Tokenizer.prototype.emStrong
       || tok.del !== Tokenizer.prototype.del;
-    const masked = (hasEmphasis || customEmphasis) ? this.maskInline(src) : src;
-    let prevWasText = false;
-    let prevChar = '';
+    const masked = (needMask || custom) ? this.blankInline(src) : src;
+    let lastChar = '';
+    let wasText = false;
     let shortest = Infinity;
     let rest = src;
     while (rest) {
@@ -320,13 +312,13 @@ class FastLexer extends Lexer {
         this.infiniteLoopError(rest.charCodeAt(0));
         break;
       }
-      if (!prevWasText) prevChar = '';
-      prevWasText = false;
+      if (!wasText) lastChar = '';
+      wasText = false;
       let token;
       if (this.options.extensions?.inline?.some((ext) => {
         token = ext.call({ lexer: this }, rest, tokens);
         if (token) {
-          rest = rest.substring(token.raw.length);
+          rest = rest.slice(token.raw.length);
           tokens.push(token);
           return true;
         }
@@ -335,98 +327,125 @@ class FastLexer extends Lexer {
         continue;
       }
       const first = rest.charCodeAt(0);
-      const tryUrl = () => {
-        if (this.state.inLink) return false;
-        const found = tok.url(rest);
-        if (!found) return false;
-        rest = rest.substring(found.raw.length);
-        tokens.push(found);
-        return true;
-      };
-      if (first === 92) { // backslash: escape, then a hard break
-        token = tok.escape(rest);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-        token = tok.br(rest);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-      } else if (first === 60) { // <: tag, then autolink
-        token = tok.tag(rest);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-        token = tok.autolink(rest);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-      } else if (first === 91 || first === 33) { // [ or !: link, then reference link
-        token = tok.link(rest);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
-        }
-        token = tok.reflink(rest, this.tokens.links);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          const prev = tokens.at(-1);
-          if (token.type === 'text' && prev?.type === 'text') {
-            prev.raw += token.raw;
-            prev.text += token.text;
-          } else {
+      switch (first) {
+        case 92: { // backslash: an escape, then a hard break
+          token = tok.escape(rest);
+          if (token) {
+            rest = rest.slice(token.raw.length);
             tokens.push(token);
+            continue;
           }
-          continue;
+          token = tok.br(rest);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
         }
-      } else if (first === 42 || first === 95) { // * or _: emphasis
-        token = tok.emStrong(rest, masked, prevChar);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 60: { // <: a tag, then an autolink
+          token = tok.tag(rest);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          token = tok.autolink(rest);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
         }
-        if (tryUrl()) continue;
-      } else if (first === 96) { // backtick: code span
-        token = tok.codespan(rest);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 91: case 33: { // [ or !: a link, then a reference link
+          token = tok.link(rest);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          token = tok.reflink(rest, this.tokens.links);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            const prev = tokens.at(-1);
+            if (token.type === 'text' && prev?.type === 'text') {
+              prev.raw += token.raw;
+              prev.text += token.text;
+            } else {
+              tokens.push(token);
+            }
+            continue;
+          }
+          break;
         }
-        if (tryUrl()) continue;
-      } else if (first === 32) { // space: hard break
-        token = tok.br(rest);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 42: case 95: { // * or _: emphasis, then a URL
+          token = tok.emStrong(rest, masked, lastChar);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          const after = this.attemptUrl(rest, tokens);
+          if (after !== null) {
+            rest = after;
+            continue;
+          }
+          break;
         }
-      } else if (first === 126) { // ~: strikethrough
-        token = tok.del(rest, masked, prevChar);
-        if (token) {
-          rest = rest.substring(token.raw.length);
-          tokens.push(token);
-          continue;
+        case 96: { // backtick: a code span, then a URL
+          token = tok.codespan(rest);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          const after = this.attemptUrl(rest, tokens);
+          if (after !== null) {
+            rest = after;
+            continue;
+          }
+          break;
         }
-        if (tryUrl()) continue;
-      } else if (canStartUrl(first)) { // letter, digit or e-mail punctuation
-        if (tryUrl()) continue;
+        case 32: { // space: a hard break
+          token = tok.br(rest);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          break;
+        }
+        case 126: { // ~: strikethrough, then a URL
+          token = tok.del(rest, masked, lastChar);
+          if (token) {
+            rest = rest.slice(token.raw.length);
+            tokens.push(token);
+            continue;
+          }
+          const after = this.attemptUrl(rest, tokens);
+          if (after !== null) {
+            rest = after;
+            continue;
+          }
+          break;
+        }
+        default: { // letter, digit or e-mail punctuation: a URL
+          if (urlStarter(first)) {
+            const after = this.attemptUrl(rest, tokens);
+            if (after !== null) {
+              rest = after;
+              continue;
+            }
+          }
+          break;
+        }
       }
       token = tok.inlineText(rest);
       if (token) {
-        rest = rest.substring(token.raw.length);
-        if (token.raw.slice(-1) !== '_') prevChar = token.raw.slice(-1);
-        prevWasText = true;
+        rest = rest.slice(token.raw.length);
+        if (token.raw.slice(-1) !== '_') lastChar = token.raw.slice(-1);
+        wasText = true;
         const prev = tokens.at(-1);
         if (prev?.type === 'text') {
           prev.raw += token.raw;
@@ -450,6 +469,6 @@ class FastLexer extends Lexer {
 // A fresh lexer and parser are built per call, so no state leaks between
 // renders and the result for one input never depends on an earlier one.
 export function parse(markdown) {
-  const tokens = new FastLexer(getDefaults()).lex(markdown);
+  const tokens = new DispatchLexer(getDefaults()).lex(markdown);
   return Parser.parse(tokens, getDefaults());
 }
